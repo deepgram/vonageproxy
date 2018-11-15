@@ -1,0 +1,15 @@
+[package]
+name = "vonageproxy"
+version = "0.1.0"
+authors = ["Nikola Whallon <nikola@deepgram.com>"]
+
+[dependencies]
+actix = "^0.7"
+actix-web = "^0.7"
+env_logger = "^0.5"
+futures-await = "^0.1"
+serde = "^1"
+serde_derive = "^1"
+serde_urlencoded = "^0.5"
+serde_json = "^1"
+url = "^1.7"
