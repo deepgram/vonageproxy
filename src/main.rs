@@ -17,56 +17,43 @@ use actix_web::{middleware, server, ws, App, HttpRequest, HttpResponse};
 use futures::prelude::{async, await};
 use futures::Future;
 use futures::Stream;
-use std::sync::Arc;
 
 mod utils;
 
 // TODO: add better logging
-// TODO: should I add some heartbeat code?
-// TODO: I could theoretically reconnect to stem if the websockets connection to stem breaks, but it would require
-// that I keep around an aggregate of the websocket messages received from the client so that I can continue to receive
-// websocket messages from the client, but I would have to send all aggregate messages first before sending new messages...
-// I hope this doesn't break the current logic too much
 
 // this creates and starts the Forwarder Actor
 // it uses a modified "start" function which increases the default size of websockets messages
-fn ws_index(
-    req: HttpRequest,
-    sender_addr: Arc<Addr<Sender>>,
-) -> Box<Future<Item = HttpResponse, Error = ActixError>> {
+fn ws_index(req: HttpRequest, sender_addr: Addr<Sender>, stem_url: String) -> Result<HttpResponse, ActixError> {
     println!("Request received: {:?}", req);
-    Box::new(
-        Forwarder::with_request(req.clone(), sender_addr).and_then(move |actor| {
-            utils::websockets::start(&req, actor, |stream| stream.max_size(10 * (1 << 20)))
-        }),
-    )
+    Forwarder::with_request(req.clone(), sender_addr, stem_url).and_then(move |actor| {
+        utils::websockets::start(&req, actor, |stream| stream.max_size(10 * (1 << 20)))
+    })
 }
 
 // the Forwarder Actor
-struct Forwarder {
+pub struct Forwarder {
     initial_request: HttpRequest, // this will be useful when connecting to stem because it contains authorization headers
     callback_url: Option<url::Url>,
     reader: Option<ws::ClientReader>,
     writer: Option<ws::ClientWriter>,
-    response_body: Vec<u8>,
-    sender: Arc<Addr<Sender>>,
+    sender: Addr<Sender>,
+    close_from_stem: bool,
+    stem_url: String,
 }
 
 // "with_request" will be used to start the Forwarder Actor
 // although the callback_url, reader, and writer will be populated later - after the first websockets text message is received
 impl Forwarder {
-    #[async] // TODO: there must be a way to not make this async - I am likely confused about the function signature
-    pub fn with_request(
-        req: HttpRequest,
-        sender_addr: Arc<Addr<Sender>>,
-    ) -> Result<Self, ActixError> {
+    pub fn with_request(req: HttpRequest, sender_addr: Addr<Sender>, stem_url: String) -> Result<Self, ActixError> {
         let result = Self {
             initial_request: req.clone(),
             callback_url: None,
             reader: None,
             writer: None,
-            response_body: Vec::new(),
-            sender: sender_addr.clone(),
+            sender: sender_addr,
+            close_from_stem: false,
+            stem_url: stem_url
         };
 
         Ok(result)
@@ -77,13 +64,34 @@ impl Actor for Forwarder {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        println!("Forwarder Actor started.");
+        println!("Forwarder Actor started called.");
+    }
+
+    fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
+        println!("Forwarder Actor stopping called.");
+        println!("close_from_stem: {}", self.close_from_stem);
+
+        if self.close_from_stem == false && self.writer.is_none() {
+            println!("Actor wants to stop even though stem is connected and hasn't sent a close request, will attempt to reconnect to stem.");
+            connect_to_stem_act(self.stem_url.clone(), self, ctx);
+            return Running::Continue;
+        }
+
+        println!("Stopping the Actor");
+        ctx.close(Some(ws::CloseReason { // TODO: this shows up as an error to the client, but it's not...
+            code: ws::CloseCode::Protocol,
+            description: Some("Job Finished".to_string()),
+        }));
+        Running::Stop
     }
 }
 
 #[derive(Deserialize, Debug)]
 struct InitialMessage {
     callback: String,
+    content_type: String,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
@@ -104,22 +112,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                                 self.callback_url = Some(callback_url);
 
                                 println!("Will attempt to connect to stem now.");
-                                let stem_connection = connect_to_stem().wait();
-                                match stem_connection {
-                                    Ok((reader, writer)) => {
-                                        self.reader = Some(reader);
-                                        self.writer = Some(writer);
-                                        ctx.add_stream(self.reader.take().unwrap().map(FromStem));
-                                    }
-                                    Err(_) => {
-                                        ctx.close(Some(ws::CloseReason {
-                                            code: ws::CloseCode::Protocol,
-                                            description: Some(
-                                                "Failed to connect to stem.".to_string(),
-                                            ),
-                                        }));
-                                    }
-                                }
+                                connect_to_stem_act(self.stem_url.clone(), self, ctx);
                             }
                             Err(_) => {
                                 ctx.close(Some(ws::CloseReason {
@@ -155,9 +148,13 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                 }
             }
             ws::Message::Close(reason) => {
+                println!("close message received from client");
+                // close connection to stem
                 if let Some(writer) = self.writer.as_mut() {
-                    writer.close(reason);
+                    writer.close(reason.clone());
                 }
+                // close connection with client
+                ctx.close(reason.clone());
             }
         }
     }
@@ -181,8 +178,18 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
         println!("ws::Message received from stem");
         match msg.into_inner() {
             ws::Message::Text(text) => {
-                println!("ws::Message was Text - appending it to the return message");
-                self.response_body.append(&mut text.into_bytes());
+                println!("ws::Message was Text - will send it to the callback");
+                match self.callback_url.clone() {
+                    Some(url) => {
+                        self.sender.do_send(SendToCallback {
+                            callback_url: url.clone(),
+                            body: text.into_bytes(),
+                        });
+                    }
+                    None => {
+                        println!("callback_url is None, but we are connected to stem - this should never happen");
+                    }
+                }
             }
             ws::Message::Binary(bin) => {
                 println!(
@@ -191,26 +198,8 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
                 );
             }
             ws::Message::Close(reason) => {
-                println!("ws::Message was Close - will send the return message to an Actor to submit to the callback, and then close the websockets connection");
-                // println!("Response_body: {:?}", self.response_body);
-                match self.callback_url.clone() {
-                    Some(url) => {
-                        self.sender.do_send(SendToCallback {
-                            callback_url: url.clone(),
-                            body: self.response_body.clone(),
-                        });
-                        ctx.close(reason);
-                    }
-                    None => {
-                        ctx.close(Some(ws::CloseReason {
-                            code: ws::CloseCode::Protocol,
-                            description: Some(
-                                "Close message received before callback url was specified."
-                                    .to_string(),
-                            ),
-                        }));
-                    }
-                }
+                println!("ws::Message was Close, setting close_from_stem state variable.");
+                self.close_from_stem = true;
             }
             _ => {
                 println!("Unhandled ws::Message (most likely a ping or a pong)");
@@ -219,28 +208,31 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
     }
 }
 
-// helper function to connect to stem
-#[async]
-pub fn connect_to_stem() -> Result<(ws::ClientReader, ws::ClientWriter), ActixError> {
-    let fut_reader_writer = await!({
-        let mut client = ws::Client::new("ws://localhost:8083/v2/listen/stream"); // TODO: don't hardcode this - get it from a toml or env
-        client = client.header(
-            header::AUTHORIZATION,
-            "Basic bmlrb2xhQGRlZXBncmFtLmNvbTpwd2Q=".to_string(),
-        ); // TODO: have this function take the headers as input, and have it get the headers from the initial http request
-        client.connect().map_err(|e| {
-            println!("Error: {}", e);
-            ()
+// helper functions to connect to stem
+pub fn connect_to_stem_act(stem_url: String, forwarder: &mut Forwarder, ctx: &mut ws::WebsocketContext<Forwarder>) {
+    connect_to_stem(stem_url)
+        .into_actor(forwarder)
+        .map(|(reader, writer), act, ctx| {
+            act.reader = Some(reader);
+            act.writer = Some(writer);
+            ctx.add_stream(act.reader.take().unwrap().map(FromStem));
         })
-    });
+        .map_err(|err, act, ctx| {
+            ctx.close(Some(ws::CloseReason {
+                code: ws::CloseCode::Protocol,
+                description: Some("Failed to connect to stem.".to_string()),
+            }));
+        })
+        .wait(ctx);
+}
 
-    if fut_reader_writer.as_ref().is_err() {
-        return Err(ErrorInternalServerError("Failed to connect to stem."));
-    }
-
-    let (reader, writer) = fut_reader_writer.unwrap();
-
-    Ok((reader, writer))
+pub fn connect_to_stem(stem_url: String) -> ws::ClientHandshake {
+    let mut client = ws::Client::new(stem_url);
+    client = client.header(
+        header::AUTHORIZATION,
+        "Basic bmlrb2xhQGRlZXBncmFtLmNvbTpwd2Q=".to_string(),
+    ); // TODO: have this function take the headers as input, and have it get the headers from the initial http request
+    client.connect()
 }
 
 // helper function to send return message to the callback - used by the Sender Actor
@@ -271,7 +263,7 @@ pub fn send_to_callback(
 
 // Sender will be the Actor which takes the aggregated body from the websockets Actor (Forwarder)
 // as a message and sends it to the callback url
-struct Sender;
+pub struct Sender;
 
 impl Actor for Sender {
     type Context = Context<Self>;
@@ -295,21 +287,48 @@ impl Handler<SendToCallback> for Sender {
     }
 }
 
+#[derive(Clone)]
+struct Config {
+    stem_url: Option<String>,
+    vonageproxy_url: Option<String>,
+}
+
 fn main() {
     ::std::env::set_var("RUST_LOG", "actix_web=trace");
     env_logger::init();
+
+    // get some config info from the environment
+    let mut config = Config { stem_url: None, vonageproxy_url: None };
+    match std::env::var("STEM_URL") {
+        Ok(url) => config.stem_url = Some(url),
+        Err(_) => {
+            println!("Error retreiving STEM_URL.");
+            std::process::exit(1);;
+        }
+    }
+    match std::env::var("VONAGEPROXY_URL") {
+        Ok(url) => config.vonageproxy_url = Some(url),
+        Err(_) => {
+            println!("Error retreiving VONAGEPROXY_URL.");
+            std::process::exit(1);;
+        }
+    }
+
     let sys = actix::System::new("wsforwarder");
 
-    server::new(|| {
-        let sender_addr = Arc::new(Sender.start()); // using Arc here to get around lifetime and ownership shenanigans
-        let sender_addr_cloned = sender_addr.clone();
+    let sender_addr = Sender.start();
+    let config_clone = config.clone();
+
+    server::new(move || {
+        let sender_addr = sender_addr.clone();
+        let stem_url = config_clone.clone().stem_url.unwrap();
         App::new()
             .middleware(middleware::Logger::default())
             .resource("/wsforwarder/", move |r| {
-                r.with(move |req| ws_index(req, sender_addr_cloned.clone()))
+                r.with(move |req| ws_index(req, sender_addr.clone(), stem_url.clone()))
             })
     })
-    .bind("127.0.0.1:8080") // TODO: don't hardcode this - get it from a toml or env
+    .bind(config.vonageproxy_url.unwrap())
     .unwrap()
     .start();
 
