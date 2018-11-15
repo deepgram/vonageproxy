@@ -8,6 +8,9 @@ extern crate serde_derive;
 extern crate serde;
 extern crate serde_json;
 extern crate url;
+#[macro_use]
+extern crate failure;
+extern crate base64;
 
 use actix::prelude::*;
 use actix_web::client::{ClientRequest, ClientRequestBuilder, SendRequest};
@@ -24,9 +27,14 @@ mod utils;
 
 // this creates and starts the Forwarder Actor
 // it uses a modified "start" function which increases the default size of websockets messages
-fn ws_index(req: HttpRequest, sender_addr: Addr<Sender>, stem_url: String) -> Result<HttpResponse, ActixError> {
+fn ws_index(
+    req: HttpRequest,
+    sender_addr: Addr<Sender>,
+    stem_url: String,
+    default_bauth: String,
+) -> Result<HttpResponse, ActixError> {
     println!("Request received: {:?}", req);
-    Forwarder::with_request(req.clone(), sender_addr, stem_url).and_then(move |actor| {
+    Forwarder::with_request(req.clone(), sender_addr, stem_url, default_bauth).and_then(move |actor| {
         utils::websockets::start(&req, actor, |stream| stream.max_size(10 * (1 << 20)))
     })
 }
@@ -40,12 +48,18 @@ pub struct Forwarder {
     sender: Addr<Sender>,
     close_from_stem: bool,
     stem_url: String,
+    bauth: String,
 }
 
 // "with_request" will be used to start the Forwarder Actor
 // although the callback_url, reader, and writer will be populated later - after the first websockets text message is received
 impl Forwarder {
-    pub fn with_request(req: HttpRequest, sender_addr: Addr<Sender>, stem_url: String) -> Result<Self, ActixError> {
+    pub fn with_request(
+        req: HttpRequest,
+        sender_addr: Addr<Sender>,
+        stem_url: String,
+        default_bauth: String,
+    ) -> Result<Self, ActixError> {
         let result = Self {
             initial_request: req.clone(),
             callback_url: None,
@@ -53,7 +67,8 @@ impl Forwarder {
             writer: None,
             sender: sender_addr,
             close_from_stem: false,
-            stem_url: stem_url
+            stem_url: stem_url,
+            bauth: default_bauth,
         };
 
         Ok(result)
@@ -73,12 +88,13 @@ impl Actor for Forwarder {
 
         if self.close_from_stem == false && self.writer.is_none() {
             println!("Actor wants to stop even though stem is connected and hasn't sent a close request, will attempt to reconnect to stem.");
-            connect_to_stem_act(self.stem_url.clone(), self, ctx);
+            connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
             return Running::Continue;
         }
 
         println!("Stopping the Actor");
-        ctx.close(Some(ws::CloseReason { // TODO: this shows up as an error to the client, but it's not...
+        ctx.close(Some(ws::CloseReason {
+            // TODO: this shows up as an error to the client, but it's not...
             code: ws::CloseCode::Protocol,
             description: Some("Job Finished".to_string()),
         }));
@@ -106,13 +122,23 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                 match initial_message {
                     Ok(result) => {
                         println!("The text received was deserialized into the initial_message json object: {:#?}", result);
+                        if result.username.is_some() && result.password.is_some() {
+                            self.bauth = utils::basic_auth::BasicAuthentication::from(
+                                    (
+                                        result.username.unwrap(),
+                                        result.password.unwrap(),
+                                    )
+                                )
+                                .to_string();
+                        }
+
                         let callback_url_option = url::Url::parse(&result.callback);
                         match callback_url_option {
                             Ok(callback_url) => {
                                 self.callback_url = Some(callback_url);
 
                                 println!("Will attempt to connect to stem now.");
-                                connect_to_stem_act(self.stem_url.clone(), self, ctx);
+                                connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
                             }
                             Err(_) => {
                                 ctx.close(Some(ws::CloseReason {
@@ -209,8 +235,13 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
 }
 
 // helper functions to connect to stem
-pub fn connect_to_stem_act(stem_url: String, forwarder: &mut Forwarder, ctx: &mut ws::WebsocketContext<Forwarder>) {
-    connect_to_stem(stem_url)
+pub fn connect_to_stem_act(
+    stem_url: String,
+    bauth: String,
+    forwarder: &mut Forwarder,
+    ctx: &mut ws::WebsocketContext<Forwarder>,
+) {
+    connect_to_stem(stem_url, bauth)
         .into_actor(forwarder)
         .map(|(reader, writer), act, ctx| {
             act.reader = Some(reader);
@@ -226,12 +257,12 @@ pub fn connect_to_stem_act(stem_url: String, forwarder: &mut Forwarder, ctx: &mu
         .wait(ctx);
 }
 
-pub fn connect_to_stem(stem_url: String) -> ws::ClientHandshake {
+pub fn connect_to_stem(stem_url: String, bauth: String) -> ws::ClientHandshake {
     let mut client = ws::Client::new(stem_url);
     client = client.header(
         header::AUTHORIZATION,
-        "Basic bmlrb2xhQGRlZXBncmFtLmNvbTpwd2Q=".to_string(),
-    ); // TODO: have this function take the headers as input, and have it get the headers from the initial http request
+        bauth,
+    );
     client.connect()
 }
 
@@ -288,9 +319,10 @@ impl Handler<SendToCallback> for Sender {
 }
 
 #[derive(Clone)]
-struct Config {
+pub struct Config {
     stem_url: Option<String>,
     vonageproxy_url: Option<String>,
+    default_bauth: Option<String>,
 }
 
 fn main() {
@@ -298,7 +330,11 @@ fn main() {
     env_logger::init();
 
     // get some config info from the environment
-    let mut config = Config { stem_url: None, vonageproxy_url: None };
+    let mut config = Config {
+        stem_url: None,
+        vonageproxy_url: None,
+        default_bauth: None,
+    };
     match std::env::var("STEM_URL") {
         Ok(url) => config.stem_url = Some(url),
         Err(_) => {
@@ -313,6 +349,13 @@ fn main() {
             std::process::exit(1);;
         }
     }
+    match std::env::var("DEFAULT_BAUTH") {
+        Ok(bauth) => config.default_bauth = Some(bauth),
+        Err(_) => {
+            println!("Error retreiving DEFAULT_BAUTH.");
+            std::process::exit(1);;
+        }
+    }
 
     let sys = actix::System::new("wsforwarder");
 
@@ -322,10 +365,11 @@ fn main() {
     server::new(move || {
         let sender_addr = sender_addr.clone();
         let stem_url = config_clone.clone().stem_url.unwrap();
+        let default_bauth = config_clone.clone().default_bauth.unwrap();
         App::new()
             .middleware(middleware::Logger::default())
             .resource("/wsforwarder/", move |r| {
-                r.with(move |req| ws_index(req, sender_addr.clone(), stem_url.clone()))
+                r.with(move |req| ws_index(req, sender_addr.clone(), stem_url.clone(), default_bauth.clone()))
             })
     })
     .bind(config.vonageproxy_url.unwrap())
