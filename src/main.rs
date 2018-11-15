@@ -24,6 +24,7 @@ use futures::Stream;
 mod utils;
 
 // TODO: add better logging
+// TODO: add better error messages
 
 // this creates and starts the Forwarder Actor
 // it uses a modified "start" function which increases the default size of websockets messages
@@ -34,14 +35,15 @@ fn ws_index(
     default_bauth: String,
 ) -> Result<HttpResponse, ActixError> {
     println!("Request received: {:?}", req);
-    Forwarder::with_request(req.clone(), sender_addr, stem_url, default_bauth).and_then(move |actor| {
-        utils::websockets::start(&req, actor, |stream| stream.max_size(10 * (1 << 20)))
-    })
+    Forwarder::with_request(&req, sender_addr, stem_url, default_bauth).and_then(
+        move |actor| {
+            utils::websockets::start(&req, actor, |stream| stream.max_size(10 * (1 << 20)))
+        },
+    )
 }
 
 // the Forwarder Actor
 pub struct Forwarder {
-    initial_request: HttpRequest, // this will be useful when connecting to stem because it contains authorization headers
     callback_url: Option<url::Url>,
     reader: Option<ws::ClientReader>,
     writer: Option<ws::ClientWriter>,
@@ -55,19 +57,18 @@ pub struct Forwarder {
 // although the callback_url, reader, and writer will be populated later - after the first websockets text message is received
 impl Forwarder {
     pub fn with_request(
-        req: HttpRequest,
+        req: &HttpRequest,
         sender_addr: Addr<Sender>,
         stem_url: String,
         default_bauth: String,
     ) -> Result<Self, ActixError> {
         let result = Self {
-            initial_request: req.clone(),
             callback_url: None,
             reader: None,
             writer: None,
             sender: sender_addr,
             close_from_stem: false,
-            stem_url: stem_url,
+            stem_url,
             bauth: default_bauth,
         };
 
@@ -86,7 +87,7 @@ impl Actor for Forwarder {
         println!("Forwarder Actor stopping called.");
         println!("close_from_stem: {}", self.close_from_stem);
 
-        if self.close_from_stem == false && self.writer.is_none() {
+        if !self.close_from_stem && self.writer.is_none() {
             println!("Actor wants to stop even though stem is connected and hasn't sent a close request, will attempt to reconnect to stem.");
             connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
             return Running::Continue;
@@ -123,13 +124,11 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                     Ok(result) => {
                         println!("The text received was deserialized into the initial_message json object: {:#?}", result);
                         if result.username.is_some() && result.password.is_some() {
-                            self.bauth = utils::basic_auth::BasicAuthentication::from(
-                                    (
-                                        result.username.unwrap(),
-                                        result.password.unwrap(),
-                                    )
-                                )
-                                .to_string();
+                            self.bauth = utils::basic_auth::BasicAuthentication::from((
+                                result.username.unwrap(),
+                                result.password.unwrap(),
+                            ))
+                            .to_string();
                         }
 
                         let callback_url_option = url::Url::parse(&result.callback);
@@ -138,7 +137,12 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                                 self.callback_url = Some(callback_url);
 
                                 println!("Will attempt to connect to stem now.");
-                                connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
+                                connect_to_stem_act(
+                                    self.stem_url.clone(),
+                                    self.bauth.clone(),
+                                    self,
+                                    ctx,
+                                );
                             }
                             Err(_) => {
                                 ctx.close(Some(ws::CloseReason {
@@ -241,6 +245,7 @@ pub fn connect_to_stem_act(
     forwarder: &mut Forwarder,
     ctx: &mut ws::WebsocketContext<Forwarder>,
 ) {
+    // TODO: make this do some loop waiting a second in between attempts or something
     connect_to_stem(stem_url, bauth)
         .into_actor(forwarder)
         .map(|(reader, writer), act, ctx| {
@@ -259,20 +264,26 @@ pub fn connect_to_stem_act(
 
 pub fn connect_to_stem(stem_url: String, bauth: String) -> ws::ClientHandshake {
     let mut client = ws::Client::new(stem_url);
-    client = client.header(
-        header::AUTHORIZATION,
-        bauth,
-    );
+    client = client.header(header::AUTHORIZATION, bauth);
     client.connect()
 }
 
 // helper function to send return message to the callback - used by the Sender Actor
 #[async]
-pub fn send_to_callback(
-    mut callback_url: url::Url,
-    response_body: Vec<u8>,
-) -> Result<(), ActixError> {
-    let mut client_req: ClientRequestBuilder = ClientRequest::post(callback_url.clone()); // TODO: parse the url and send authorization headers
+pub fn send_to_callback(callback_url: url::Url, response_body: Vec<u8>) -> Result<(), ActixError> {
+    let mut client_req: ClientRequestBuilder = ClientRequest::post(callback_url.clone());
+
+    // check the callback_url to see if it has a username and password to use to make an authorization header
+    let mut auth_header = match (callback_url.username(), callback_url.password()) {
+        (username, Some(password)) if !username.is_empty() => {
+            Some(utils::basic_auth::BasicAuthentication::from((username, password)).to_string())
+        }
+        _ => None,
+    };
+
+    if let Some(ref header) = auth_header {
+        client_req.set_header("Authorization", header.clone());
+    }
 
     let fut: SendRequest = client_req
         .timeout(std::time::Duration::from_secs(600))
@@ -282,7 +293,7 @@ pub fn send_to_callback(
             ErrorInternalServerError("Failed to set callback request body.")
         })?
         .send()
-        .timeout(std::time::Duration::from_secs(600));
+        .timeout(std::time::Duration::from_secs(600)); // TODO: make this configurable
 
     let response = await!(fut).map_err(|e| {
         println!("Error: {}", e);
@@ -369,7 +380,14 @@ fn main() {
         App::new()
             .middleware(middleware::Logger::default())
             .resource("/wsforwarder/", move |r| {
-                r.with(move |req| ws_index(req, sender_addr.clone(), stem_url.clone(), default_bauth.clone()))
+                r.with(move |req| {
+                    ws_index(
+                        req,
+                        sender_addr.clone(),
+                        stem_url.clone(),
+                        default_bauth.clone(),
+                    )
+                })
             })
     })
     .bind(config.vonageproxy_url.unwrap())
