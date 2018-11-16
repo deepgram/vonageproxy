@@ -242,6 +242,7 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
 
     fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
         println!("Stem stream got an error... will stop...");
+        ctx.stop();
         Running::Stop
     }
 
