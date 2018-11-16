@@ -15,7 +15,7 @@ extern crate openssl_probe;
 
 use actix::prelude::*;
 use actix_web::client::{ClientRequest, ClientRequestBuilder, SendRequest};
-use actix_web::error::{Error as ActixError, ErrorInternalServerError};
+use actix_web::error::{Error as ActixError, ErrorBadRequest, ErrorInternalServerError};
 use actix_web::http::header;
 use actix_web::{middleware, server, ws, App, HttpRequest, HttpResponse};
 use futures::prelude::{async, await};
@@ -92,9 +92,58 @@ impl Actor for Forwarder {
 #[derive(Deserialize, Debug)]
 struct InitialMessage {
     callback: String,
+    #[serde(rename = "content-type")]
     content_type: String,
     username: Option<String>,
     password: Option<String>,
+}
+
+// function to help parse audio format of the type: audio/l16;rate=16000
+// currently, only l16 is supported, but any sample rate is supported
+// the function returns a query string which should be appended to the stem url
+pub fn parse_content_type(content_type: String) -> Result<String, ActixError> {
+    // if content type was left empty, we don't need to append a query string, just assume they were uploading a file
+    if content_type == "" {
+        return Ok("".to_string());
+    }
+
+    let split: Vec<&str> = content_type.split(";").collect();
+
+    if split.len() != 2 {
+        println!("Failed to parse content-type.");
+        return Err(ErrorBadRequest("Failed to parse content-type."));
+    }
+
+    let first = split[0].to_string();
+    let second = split[1].to_string();
+    let split_audio: Vec<&str> = first.split("/").collect();
+    let split_rate: Vec<&str> = second.split("=").collect();
+
+    if split_audio.len() != 2 {
+        println!("Failed to parse content-type.");
+        return Err(ErrorBadRequest("Failed to parse content-type."));
+    }
+    if split_rate.len() != 2 {
+        println!("Failed to parse content-type.");
+        return Err(ErrorBadRequest("Failed to parse content-type."));
+    }
+
+    let mut split_encoding = split_audio[1].to_string();
+    let split_rate_value = split_rate[1].to_string();
+
+    if split_encoding == "l16" {
+        split_encoding = "linear16".to_string();
+    } else {
+        println!("Failed to parse content-type.");
+        return Err(ErrorBadRequest("Failed to parse content-type."));
+    }
+
+    let result = format!(
+        "?encoding={}&sample_rate={}&channels=1",
+        split_encoding, split_rate_value
+    );
+
+    Ok(result)
 }
 
 impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
@@ -109,6 +158,21 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                 match initial_message {
                     Ok(result) => {
                         println!("The text received was deserialized into the initial_message json object: {:#?}", result);
+                        println!("content_type: {}", result.content_type);
+                        match parse_content_type(result.content_type) {
+                            Ok(query_string) => {
+                                println!("query_string: {}", query_string);
+                                self.stem_url.push_str(&query_string);
+                            }
+                            Err(_) => {
+                                ctx.close(Some(ws::CloseReason {
+                                    code: ws::CloseCode::Protocol,
+                                    description: Some("Failed to parse content-type.".to_string()),
+                                }));
+                                ctx.stop();
+                            }
+                        }
+
                         if result.username.is_some() && result.password.is_some() {
                             self.bauth = utils::basic_auth::BasicAuthentication::from((
                                 result.username.unwrap(),
@@ -174,6 +238,12 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                 ctx.stop();
             }
         }
+    }
+
+    fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
+        println!("Client stream got an error... will...");
+        println!("Stop.");
+        Running::Stop
     }
 
     fn finished(&mut self, ctx: &mut Self::Context) {
