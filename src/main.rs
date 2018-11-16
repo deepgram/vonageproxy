@@ -37,11 +37,9 @@ fn ws_index(
     default_bauth: String,
 ) -> Result<HttpResponse, ActixError> {
     println!("Request received: {:?}", req);
-    Forwarder::with_request(&req, sender_addr, stem_url, default_bauth).and_then(
-        move |actor| {
-            utils::websockets::start(&req, actor, |stream| stream.max_size(10 * (1 << 20)))
-        },
-    )
+    Forwarder::with_request(&req, sender_addr, stem_url, default_bauth).and_then(move |actor| {
+        utils::websockets::start(&req, actor, |stream| stream.max_size(10 * (1 << 20)))
+    })
 }
 
 // the Forwarder Actor
@@ -159,10 +157,10 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                 }
             }
             ws::Message::Ping(msg) => {
-//                println!("Ping from client.");
+                //                println!("Ping from client.");
             }
             ws::Message::Pong(msg) => {
-//                println!("Pong from client.");
+                //                println!("Pong from client.");
             }
             ws::Message::Close(reason) => {
                 println!("Close message received from client - will close websocket connections to stem and the client.");
@@ -241,8 +239,9 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
     }
 
     fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
-        println!("Stem stream got an error... will stop...");
-        ctx.stop();
+        println!("Stem stream got an error... will...");
+        println!("Will attempt to reconnect to stem now.");
+        connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
         Running::Stop
     }
 
