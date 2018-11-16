@@ -11,6 +11,7 @@ extern crate url;
 #[macro_use]
 extern crate failure;
 extern crate base64;
+extern crate openssl_probe;
 
 use actix::prelude::*;
 use actix_web::client::{ClientRequest, ClientRequestBuilder, SendRequest};
@@ -266,7 +267,7 @@ pub fn connect_to_stem_act(
             ctx.add_stream(act.reader.take().unwrap().map(FromStem));
         })
         .map_err(|err, act, ctx| {
-            println!("Failed to connect to stem.");
+            println!("Failed to connect to stem. {:?}", err);
             ctx.close(Some(ws::CloseReason {
                 code: ws::CloseCode::Protocol,
                 description: Some("Failed to connect to stem.".to_string()),
@@ -351,6 +352,7 @@ pub struct Config {
 }
 
 fn main() {
+    openssl_probe::init_ssl_cert_env_vars();
     ::std::env::set_var("RUST_LOG", "actix_web=trace");
     env_logger::init();
 
