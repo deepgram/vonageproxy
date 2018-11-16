@@ -20,11 +20,13 @@ use actix_web::{middleware, server, ws, App, HttpRequest, HttpResponse};
 use futures::prelude::{async, await};
 use futures::Future;
 use futures::Stream;
+use std::time::Duration;
 
 mod utils;
 
 // TODO: add better logging
 // TODO: add better error messages
+// TODO: separate websocket Actors for connection to client and connection to stem
 
 // this creates and starts the Forwarder Actor
 // it uses a modified "start" function which increases the default size of websockets messages
@@ -48,7 +50,6 @@ pub struct Forwarder {
     reader: Option<ws::ClientReader>,
     writer: Option<ws::ClientWriter>,
     sender: Addr<Sender>,
-    close_from_stem: bool,
     stem_url: String,
     bauth: String,
 }
@@ -67,7 +68,6 @@ impl Forwarder {
             reader: None,
             writer: None,
             sender: sender_addr,
-            close_from_stem: false,
             stem_url,
             bauth: default_bauth,
         };
@@ -85,20 +85,7 @@ impl Actor for Forwarder {
 
     fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
         println!("Forwarder Actor stopping called.");
-        println!("close_from_stem: {}", self.close_from_stem);
-
-        if !self.close_from_stem && self.writer.is_none() {
-            println!("Actor wants to stop even though stem is connected and hasn't sent a close request, will attempt to reconnect to stem.");
-            connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
-            return Running::Continue;
-        }
-
         println!("Stopping the Actor");
-        ctx.close(Some(ws::CloseReason {
-            // TODO: this shows up as an error to the client, but it's not...
-            code: ws::CloseCode::Protocol,
-            description: Some("Job Finished".to_string()),
-        }));
         Running::Stop
     }
 }
@@ -149,6 +136,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                                     code: ws::CloseCode::Protocol,
                                     description: Some("Failed to parse callback url.".to_string()),
                                 }));
+                                ctx.stop();
                             }
                         }
                     }
@@ -159,34 +147,39 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                                 "Failed to parse websockets text as json.".to_string(),
                             ),
                         }));
+                        ctx.stop();
                     }
                 }
             }
             ws::Message::Binary(bin) => {
-                if let Some(writer) = self.writer.as_mut() {
-                    writer.binary(bin);
+                if !bin.is_empty() {
+                    if let Some(writer) = self.writer.as_mut() {
+                        writer.binary(bin);
+                    }
                 }
             }
             ws::Message::Ping(msg) => {
-                if let Some(writer) = self.writer.as_mut() {
-                    writer.ping(&msg);
-                }
+//                println!("Ping from client.");
             }
             ws::Message::Pong(msg) => {
-                if let Some(writer) = self.writer.as_mut() {
-                    writer.pong(&msg);
-                }
+//                println!("Pong from client.");
             }
             ws::Message::Close(reason) => {
-                println!("close message received from client");
+                println!("Close message received from client - will close websocket connections to stem and the client.");
                 // close connection to stem
                 if let Some(writer) = self.writer.as_mut() {
                     writer.close(reason.clone());
                 }
                 // close connection with client
                 ctx.close(reason.clone());
+                ctx.stop();
             }
         }
+    }
+
+    fn finished(&mut self, ctx: &mut Self::Context) {
+        println!("Client stream handler finished.");
+        ctx.stop();
     }
 }
 
@@ -204,6 +197,10 @@ impl Message for FromStem {
 }
 
 impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
+    fn started(&mut self, ctx: &mut Self::Context) {
+        println!("Stem stream handler started.");
+    }
+
     fn handle(&mut self, msg: FromStem, ctx: &mut Self::Context) {
         println!("ws::Message received from stem");
         match msg.into_inner() {
@@ -228,13 +225,28 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
                 );
             }
             ws::Message::Close(reason) => {
-                println!("ws::Message was Close, setting close_from_stem state variable.");
-                self.close_from_stem = true;
+                println!("ws::Message was Close, closing connection with stem and client.");
+                // close connection to stem
+                if let Some(writer) = self.writer.as_mut() {
+                    writer.close(reason.clone());
+                }
+                // close connection with client
+                ctx.close(reason.clone());
+                ctx.stop();
             }
             _ => {
                 println!("Unhandled ws::Message (most likely a ping or a pong)");
             }
         }
+    }
+
+    fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
+        println!("Stem stream got an error... will stop...");
+        Running::Stop
+    }
+
+    fn finished(&mut self, ctx: &mut Self::Context) {
+        println!("Stem stream handler finished.");
     }
 }
 
@@ -254,10 +266,12 @@ pub fn connect_to_stem_act(
             ctx.add_stream(act.reader.take().unwrap().map(FromStem));
         })
         .map_err(|err, act, ctx| {
+            println!("Failed to connect to stem.");
             ctx.close(Some(ws::CloseReason {
                 code: ws::CloseCode::Protocol,
                 description: Some("Failed to connect to stem.".to_string()),
             }));
+            ctx.stop();
         })
         .wait(ctx);
 }
@@ -379,7 +393,7 @@ fn main() {
         let default_bauth = config_clone.clone().default_bauth.unwrap();
         App::new()
             .middleware(middleware::Logger::default())
-            .resource("/wsforwarder/", move |r| {
+            .resource("/", move |r| {
                 r.with(move |req| {
                     ws_index(
                         req,
