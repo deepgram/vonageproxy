@@ -12,6 +12,10 @@ extern crate url;
 extern crate failure;
 extern crate base64;
 extern crate openssl_probe;
+#[macro_use]
+extern crate log;
+extern crate chrono;
+extern crate env_logger;
 
 use actix::prelude::*;
 use actix_web::client::{ClientRequest, ClientRequestBuilder, SendRequest};
@@ -24,8 +28,8 @@ use futures::Stream;
 use std::time::Duration;
 
 mod utils;
+mod logging;
 
-// TODO: add better logging
 // TODO: add better error messages
 // TODO: separate websocket Actors for connection to client and connection to stem
 
@@ -37,7 +41,7 @@ fn ws_index(
     stem_url: String,
     default_bauth: String,
 ) -> Result<HttpResponse, ActixError> {
-    println!("Request received: {:?}", req);
+    info!("Request received: {:?}", req);
     Forwarder::with_request(&req, sender_addr, stem_url, default_bauth).and_then(move |actor| {
         utils::websockets::start(&req, actor, |stream| stream.max_size(10 * (1 << 20)))
     })
@@ -79,12 +83,12 @@ impl Actor for Forwarder {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        println!("Forwarder Actor started called.");
+        info!("Forwarder Actor started called.");
     }
 
     fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
-        println!("Forwarder Actor stopping called.");
-        println!("Stopping the Actor");
+        info!("Forwarder Actor stopping called.");
+        info!("Stopping the Actor");
         Running::Stop
     }
 }
@@ -110,7 +114,7 @@ pub fn parse_content_type(content_type: String) -> Result<String, ActixError> {
     let split: Vec<&str> = content_type.split(";").collect();
 
     if split.len() != 2 {
-        println!("Failed to parse content-type.");
+        error!("Failed to parse content-type.");
         return Err(ErrorBadRequest("Failed to parse content-type."));
     }
 
@@ -120,11 +124,11 @@ pub fn parse_content_type(content_type: String) -> Result<String, ActixError> {
     let split_rate: Vec<&str> = second.split("=").collect();
 
     if split_audio.len() != 2 {
-        println!("Failed to parse content-type.");
+        error!("Failed to parse content-type.");
         return Err(ErrorBadRequest("Failed to parse content-type."));
     }
     if split_rate.len() != 2 {
-        println!("Failed to parse content-type.");
+        error!("Failed to parse content-type.");
         return Err(ErrorBadRequest("Failed to parse content-type."));
     }
 
@@ -134,7 +138,7 @@ pub fn parse_content_type(content_type: String) -> Result<String, ActixError> {
     if split_encoding == "l16" {
         split_encoding = "linear16".to_string();
     } else {
-        println!("Failed to parse content-type.");
+        error!("Failed to parse content-type.");
         return Err(ErrorBadRequest("Failed to parse content-type."));
     }
 
@@ -148,20 +152,20 @@ pub fn parse_content_type(content_type: String) -> Result<String, ActixError> {
 
 impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
     fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
-        // println!("ws::Message received: {:?}", msg);
+        // info!("ws::Message received: {:?}", msg);
         match msg {
             ws::Message::Text(text) => {
-                println!("Text received - will attempt to interpret as initial json object specifying callback and content-type.");
+                info!("Text received - will attempt to interpret as initial json object specifying callback and content-type.");
 
                 let initial_message: Result<InitialMessage, serde_json::Error> =
                     serde_json::from_str(&text);
                 match initial_message {
                     Ok(result) => {
-                        println!("The text received was deserialized into the initial_message json object: {:#?}", result);
-                        println!("content_type: {}", result.content_type);
+                        info!("The text received was deserialized into an initial_message json object.");
+                        info!("content_type: {}", result.content_type);
                         match parse_content_type(result.content_type) {
                             Ok(query_string) => {
-                                println!("query_string: {}", query_string);
+                                info!("query_string: {}", query_string);
                                 self.stem_url.push_str(&query_string);
                             }
                             Err(_) => {
@@ -186,7 +190,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                             Ok(callback_url) => {
                                 self.callback_url = Some(callback_url);
 
-                                println!("Will attempt to connect to stem now.");
+                                info!("Will attempt to connect to stem now.");
                                 connect_to_stem_act(
                                     self.stem_url.clone(),
                                     self.bauth.clone(),
@@ -222,13 +226,17 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                 }
             }
             ws::Message::Ping(msg) => {
-                //                println!("Ping from client.");
-            }
+                info!("Received ping from client: {:?}", msg);
+                info!("Will send pong back.");
+                ctx.pong(&msg);
+            },
             ws::Message::Pong(msg) => {
-                //                println!("Pong from client.");
-            }
+                info!("Received pong from client: {:?}", msg);
+                info!("Will ignore.");
+            },
             ws::Message::Close(reason) => {
-                println!("Close message received from client - will close websocket connections to stem and the client.");
+                info!("Close message received from client - will close websocket connections to stem and the client.");
+                info!("{:?}", reason);
                 // close connection to stem
                 if let Some(writer) = self.writer.as_mut() {
                     writer.close(reason.clone());
@@ -241,13 +249,13 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
     }
 
     fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
-        println!("Client stream got an error... will...");
-        println!("Stop.");
+        error!("Client stream got an error... will...");
+        error!("Stop.");
         Running::Stop
     }
 
     fn finished(&mut self, ctx: &mut Self::Context) {
-        println!("Client stream handler finished.");
+        info!("Client stream handler finished.");
         ctx.stop();
     }
 }
@@ -267,14 +275,14 @@ impl Message for FromStem {
 
 impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
     fn started(&mut self, ctx: &mut Self::Context) {
-        println!("Stem stream handler started.");
+        info!("Stem stream handler started.");
     }
 
     fn handle(&mut self, msg: FromStem, ctx: &mut Self::Context) {
-        println!("ws::Message received from stem");
+        info!("ws::Message received from stem");
         match msg.into_inner() {
             ws::Message::Text(text) => {
-                println!("ws::Message was Text - will send it to the callback");
+                info!("ws::Message was Text - will send it to the callback");
                 match self.callback_url.clone() {
                     Some(url) => {
                         self.sender.do_send(SendToCallback {
@@ -283,18 +291,18 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
                         });
                     }
                     None => {
-                        println!("callback_url is None, but we are connected to stem - this should never happen");
+                        error!("callback_url is None, but we are connected to stem - this should never happen");
                     }
                 }
             }
             ws::Message::Binary(bin) => {
-                println!(
+                info!(
                     "ws::Message was Binary: {:?} - will not do anything with it...",
                     bin
                 );
             }
             ws::Message::Close(reason) => {
-                println!("ws::Message was Close, closing connection with stem and client.");
+                info!("ws::Message was Close, closing connection with stem and client.");
                 // close connection to stem
                 if let Some(writer) = self.writer.as_mut() {
                     writer.close(reason.clone());
@@ -303,21 +311,29 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
                 ctx.close(reason.clone());
                 ctx.stop();
             }
-            _ => {
-                println!("Unhandled ws::Message (most likely a ping or a pong)");
+            ws::Message::Ping(msg) => {
+                info!("Received ping from stem: {:?}", msg);
+                info!("Will attempt to send pong back.");
+                if let Some(writer) = self.writer.as_mut() {
+                    writer.pong(&msg);
+                }
+            }
+            ws::Message::Pong(msg) => {
+                info!("Received pong from stem: {:?}", msg);
+                info!("Will ignore");
             }
         }
     }
 
     fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
-        println!("Stem stream got an error... will...");
-        println!("Will attempt to reconnect to stem now.");
+        error!("Stem stream got an error... will...");
+        error!("Will attempt to reconnect to stem now.");
         connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
         Running::Stop
     }
 
     fn finished(&mut self, ctx: &mut Self::Context) {
-        println!("Stem stream handler finished.");
+        info!("Stem stream handler finished.");
     }
 }
 
@@ -337,7 +353,7 @@ pub fn connect_to_stem_act(
             ctx.add_stream(act.reader.take().unwrap().map(FromStem));
         })
         .map_err(|err, act, ctx| {
-            println!("Failed to connect to stem. {:?}", err);
+            error!("Failed to connect to stem. {:?}", err);
             ctx.close(Some(ws::CloseReason {
                 code: ws::CloseCode::Protocol,
                 description: Some("Failed to connect to stem.".to_string()),
@@ -374,14 +390,14 @@ pub fn send_to_callback(callback_url: url::Url, response_body: Vec<u8>) -> Resul
         .timeout(std::time::Duration::from_secs(600))
         .body(response_body)
         .map_err(|e| {
-            println!("Error: {}", e);
+            error!("Error: {}", e);
             ErrorInternalServerError("Failed to set callback request body.")
         })?
         .send()
         .timeout(std::time::Duration::from_secs(600)); // TODO: make this configurable
 
     let response = await!(fut).map_err(|e| {
-        println!("Error: {}", e);
+        error!("Error: {}", e);
         ErrorInternalServerError("Failed to sent callback request.")
     })?;
 
@@ -409,7 +425,7 @@ impl Handler<SendToCallback> for Sender {
     type Result = Box<Future<Item = (), Error = ActixError>>;
 
     fn handle(&mut self, msg: SendToCallback, _: &mut Self::Context) -> Self::Result {
-        println!("Sender received message SendToCallback.");
+        info!("Sender received message SendToCallback.");
         Box::new(send_to_callback(msg.callback_url, msg.body))
     }
 }
@@ -424,7 +440,18 @@ pub struct Config {
 fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     ::std::env::set_var("RUST_LOG", "actix_web=trace");
-    env_logger::init();
+
+    logging::from_verbosity(
+        3,
+        Some(vec![
+            "tokio_threadpool",
+            "tokio_reactor",
+            "tokio_core",
+            "mio",
+            "hyper",
+            "trust-dns-proto",
+        ]),
+    );
 
     // get some config info from the environment
     let mut config = Config {
@@ -435,21 +462,21 @@ fn main() {
     match std::env::var("STEM_URL") {
         Ok(url) => config.stem_url = Some(url),
         Err(_) => {
-            println!("Error retreiving STEM_URL.");
+            error!("Error retreiving STEM_URL.");
             std::process::exit(1);;
         }
     }
     match std::env::var("VONAGEPROXY_URL") {
         Ok(url) => config.vonageproxy_url = Some(url),
         Err(_) => {
-            println!("Error retreiving VONAGEPROXY_URL.");
+            error!("Error retreiving VONAGEPROXY_URL.");
             std::process::exit(1);;
         }
     }
     match std::env::var("DEFAULT_BAUTH") {
         Ok(bauth) => config.default_bauth = Some(bauth),
         Err(_) => {
-            println!("Error retreiving DEFAULT_BAUTH.");
+            error!("Error retreiving DEFAULT_BAUTH.");
             std::process::exit(1);;
         }
     }

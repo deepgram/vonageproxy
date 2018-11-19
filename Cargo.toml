@@ -1,6 +1,6 @@
 [package]
 name = "vonageproxy"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Nikola Whallon <nikola@deepgram.com>"]
 
 [dependencies]
@@ -16,3 +16,5 @@ serde_json = "^1"
 url = "^1.7"
 failure = "^0.1"
 base64 = "^0.9"
+chrono = "^0.4"
+log = "^0.4"
