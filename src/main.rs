@@ -493,6 +493,11 @@ fn main() {
         let sender_addr = sender_addr.clone();
         let stem_url = config_clone.clone().stem_url.unwrap();
         let default_bauth = config_clone.clone().default_bauth.unwrap();
+
+        let sender_addr2 = sender_addr.clone();
+        let stem_url2 = config_clone.clone().stem_url.unwrap();
+        let default_bauth2 = config_clone.clone().default_bauth.unwrap();
+
         App::new()
             .middleware(middleware::Logger::default())
             .resource("/", move |r| {
@@ -502,6 +507,16 @@ fn main() {
                         sender_addr.clone(),
                         stem_url.clone(),
                         default_bauth.clone(),
+                    )
+                })
+            })
+            .resource("//", move |r| {
+                r.with(move |req| {
+                    ws_index(
+                        req,
+                        sender_addr2.clone(),
+                        stem_url2.clone(),
+                        default_bauth2.clone(),
                     )
                 })
             })
