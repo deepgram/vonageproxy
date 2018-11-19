@@ -169,6 +169,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                                 self.stem_url.push_str(&query_string);
                             }
                             Err(_) => {
+                                error!("Failed to parse content-type.");
                                 ctx.close(Some(ws::CloseReason {
                                     code: ws::CloseCode::Protocol,
                                     description: Some("Failed to parse content-type.".to_string()),
@@ -199,6 +200,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                                 );
                             }
                             Err(_) => {
+                                error!("Failed to parse callbackurl.");
                                 ctx.close(Some(ws::CloseReason {
                                     code: ws::CloseCode::Protocol,
                                     description: Some("Failed to parse callback url.".to_string()),
@@ -208,6 +210,7 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                         }
                     }
                     Err(_) => {
+                        error!("Failed to parse websockets text as json.");
                         ctx.close(Some(ws::CloseReason {
                             code: ws::CloseCode::Protocol,
                             description: Some(
