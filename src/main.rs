@@ -152,7 +152,7 @@ pub fn parse_content_type(content_type: String) -> Result<String, ActixError> {
 
 impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
     fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
-        // info!("ws::Message received: {:?}", msg);
+        info!("ws::Message received from client: {:?}", msg);
         match msg {
             ws::Message::Text(text) => {
                 info!("Text received - will attempt to interpret as initial json object specifying callback and content-type.");
