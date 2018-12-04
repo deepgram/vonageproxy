@@ -1,6 +1,6 @@
 [package]
 name = "vonageproxy"
-version = "0.2.4"
+version = "0.2.5"
 authors = ["Nikola Whallon <nikola@deepgram.com>"]
 
 [dependencies]
