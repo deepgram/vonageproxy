@@ -25,10 +25,12 @@ use actix_web::{middleware, server, ws, App, HttpRequest, HttpResponse};
 use futures::prelude::{async, await};
 use futures::Future;
 use futures::Stream;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-mod utils;
 mod logging;
+mod utils;
 
 // TODO: add better error messages
 // TODO: separate websocket Actors for connection to client and connection to stem
@@ -152,7 +154,7 @@ pub fn parse_content_type(content_type: String) -> Result<String, ActixError> {
 
 impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
     fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
-        info!("ws::Message received from client: {:?}", msg);
+        //        info!("ws::Message received from client: {:?}", msg);
         match msg {
             ws::Message::Text(text) => {
                 info!("Text received - will attempt to interpret as initial json object specifying callback and content-type.");
@@ -222,21 +224,29 @@ impl StreamHandler<ws::Message, ws::ProtocolError> for Forwarder {
                 }
             }
             ws::Message::Binary(bin) => {
+                info!("Binary message received from client.");
                 if !bin.is_empty() {
                     if let Some(writer) = self.writer.as_mut() {
+                        info!("Writer available - writing.");
                         writer.binary(bin);
                     }
+                    if self.writer.is_none() {
+                        info!("Writer not available, will attempt to connect to stem.");
+                        connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
+                    }
+                } else {
+                    info!("Empty binary message, ignoring.");
                 }
             }
             ws::Message::Ping(msg) => {
                 info!("Received ping from client: {:?}", msg);
                 info!("Will send pong back.");
                 ctx.pong(&msg);
-            },
+            }
             ws::Message::Pong(msg) => {
                 info!("Received pong from client: {:?}", msg);
                 info!("Will ignore.");
-            },
+            }
             ws::Message::Close(reason) => {
                 info!("Close message received from client - will close websocket connections to stem and the client.");
                 info!("{:?}", reason);
@@ -306,6 +316,7 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
             }
             ws::Message::Close(reason) => {
                 info!("ws::Message was Close, closing connection with stem and client.");
+                info!("stem's reason: {:?}", reason);
                 // close connection to stem
                 if let Some(writer) = self.writer.as_mut() {
                     writer.close(reason.clone());
@@ -329,7 +340,7 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
     }
 
     fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
-        error!("Stem stream got an error... will...");
+        error!("Stem stream got an error... {:?} ... will...", err);
         error!("Will attempt to reconnect to stem now.");
         connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
         Running::Stop
@@ -348,7 +359,8 @@ pub fn connect_to_stem_act(
     ctx: &mut ws::WebsocketContext<Forwarder>,
 ) {
     // TODO: make this do some loop waiting a second in between attempts or something
-    connect_to_stem(stem_url, bauth)
+    info!("will try to connect to stem using the url: {:?}", stem_url);
+    connect_to_stem(stem_url.clone(), bauth.clone())
         .into_actor(forwarder)
         .map(|(reader, writer), act, ctx| {
             act.reader = Some(reader);
@@ -357,11 +369,11 @@ pub fn connect_to_stem_act(
         })
         .map_err(|err, act, ctx| {
             error!("Failed to connect to stem. {:?}", err);
-            ctx.close(Some(ws::CloseReason {
-                code: ws::CloseCode::Protocol,
-                description: Some("Failed to connect to stem.".to_string()),
-            }));
-            ctx.stop();
+            //            ctx.close(Some(ws::CloseReason {
+            //                code: ws::CloseCode::Protocol,
+            //                description: Some("Failed to connect to stem.".to_string()),
+            //            }));
+            //            ctx.stop();
         })
         .wait(ctx);
 }
