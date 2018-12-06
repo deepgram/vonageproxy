@@ -315,15 +315,15 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
                 );
             }
             ws::Message::Close(reason) => {
-                info!("ws::Message was Close, closing connection with stem and client.");
+                info!("ws::Message was Close, will close the writer but otherwise ignore...");
                 info!("stem's reason: {:?}", reason);
                 // close connection to stem
                 if let Some(writer) = self.writer.as_mut() {
                     writer.close(reason.clone());
                 }
                 // close connection with client
-                ctx.close(reason.clone());
-                ctx.stop();
+//                ctx.close(reason.clone());
+//                ctx.stop();
             }
             ws::Message::Ping(msg) => {
                 info!("Received ping from stem: {:?}", msg);
