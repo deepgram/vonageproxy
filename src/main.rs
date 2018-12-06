@@ -321,6 +321,11 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
                 if let Some(writer) = self.writer.as_mut() {
                     writer.close(reason.clone());
                 }
+                if self.writer.is_some() {
+                    info!("making writer and reader None");
+                    self.writer = None;
+                    self.reader = None;
+                }
                 // close connection with client
 //                ctx.close(reason.clone());
 //                ctx.stop();
@@ -342,6 +347,9 @@ impl StreamHandler<FromStem, ws::ProtocolError> for Forwarder {
     fn error(&mut self, err: ws::ProtocolError, ctx: &mut Self::Context) -> Running {
         error!("Stem stream got an error... {:?} ... will...", err);
         error!("Will attempt to reconnect to stem now.");
+        info!("making writer and reader None");
+        self.writer = None;
+        self.reader = None;
         connect_to_stem_act(self.stem_url.clone(), self.bauth.clone(), self, ctx);
         Running::Stop
     }
